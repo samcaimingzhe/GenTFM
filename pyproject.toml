@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gen-tfm"
+version = "0.1.0"
+description = "In-context synthetic tabular data generation with a tabular foundation model"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "pyarrow>=12",
+    "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+train = ["xgboost>=2.0"]
+notebook = ["jupyter"]
+
+[tool.setuptools.packages.find]
+include = ["gen_tfm*"]
