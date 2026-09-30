@@ -1,0 +1,19 @@
+# GPU servers: install a CUDA-compatible PyTorch build first.
+# An existing torch satisfying this requirement will be reused by pip.
+torch>=2.3
+
+# Synthetic table prior: pin the installed TabICL API used by data/prior.py.
+tabicl==2.1.1
+# TabICL's prior imports XGBoost even when selecting mlp_scm.
+xgboost
+
+# Training, plotting, and evaluation.
+numpy
+scipy
+scikit-learn>=1.3
+matplotlib
+
+# Real-table DataFrame / Hugging Face / parquet adapters.
+pandas
+huggingface-hub
+pyarrow
