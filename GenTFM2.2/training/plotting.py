@@ -6,7 +6,7 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
 
-def save_loss_curve(train_history, validation_history, path):
+def save_loss_curve(train_history, validation_history, path, *, ylabel="Velocity MSE"):
     """Save (step, loss) histories to a PNG; return its path.
 
     Training contains every optimizer step. Validation contains only the actual
@@ -26,7 +26,7 @@ def save_loss_curve(train_history, validation_history, path):
         steps, losses = zip(*validation_history)
         axis.plot(steps, losses, label="Validation loss", color="#ea580c",
                   linewidth=1.8, marker="o", markersize=4)
-    axis.set(title="Flow matching loss", xlabel="Training step", ylabel="Velocity MSE")
+    axis.set(title="Flow matching loss", xlabel="Training step", ylabel=ylabel)
     axis.xaxis.set_major_locator(MaxNLocator(integer=True))
     axis.grid(True, alpha=0.25)
     axis.legend()

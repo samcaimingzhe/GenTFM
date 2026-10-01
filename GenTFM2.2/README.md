@@ -33,35 +33,55 @@ GenTFM2.2/
 各 Python 套件另有 `__init__.py`。`model/` 只包含神經網路架構；
 loss 定義在 `training/flow_matching.py`，Euler／Heun 採樣定義在 `inference/sampling.py`。
 
-模型由 ColEmbedding、時間 embedding、RowInteraction 和逐 cell 速度頭組成。
+模型由 ColEmbedding、時間 embedding、RowInteraction、逐 cell 速度頭和類別分類頭組成。
+訓練入口會配置混合 schema，分類頭以各類別欄的有效 one-hot 座標表示平均池化，
+再用共用 MLP 輸出該欄的類別 logits。沒有缺失 mask 頭或 feature_mask 預測頭。
 
 ```python
 from model import GenTFM
+from data.encoding import Schema
 ```
 
 模型接口：
 
 ```python
+schema = Schema(max_cont=32, max_cat=8, cat_cardinality=12)
+model = GenTFM(max_features=schema.encoded_dim, max_cont=schema.max_cont,
+               max_cat=schema.max_cat, cat_cardinality=schema.cat_cardinality)
 velocity = model(x_t, t, feature_mask)
+outputs = model(x_t, t, feature_mask, return_aux=True)
+# outputs["velocity"]: (B, K, D)
+# outputs["categorical_logits"]: (B, K, max_cat, cat_cardinality)
 # x_t / velocity: (B, K, D)
 # t: (B,)，每張表一個時間，範圍 [0, 1]
 # feature_mask: (B, D)，bool，True 表示有效編碼維度
 ```
 
 這裡的 D 是 encoding.py 的編碼維度：連續值、類別 one-hot 和觀測標記。
-類別欄不是單一維度；所有有效編碼維度的 loss 權重相同。
+類別欄不是單一維度；數值與有效 one-hot 座標的速度 MSE 權重相同。
+有效觀測標記固定為 1，速度為零，不參與 MSE。feature_mask 仍由外部提供，
+表示完整編碼中的有效維度；它也決定各類別欄的有效類別。
 
 ## Loss
 
 取標準高斯噪聲 x0、prior 樣本 x1 和 t ~ Uniform(0, 1)：
 
 ```text
-xt = (1-t) * x0 + t * x1
+xt = (1-t) * x0 + t * x1       # 僅數值與類別 one-hot 座標
 目標速度 = x1 - x0
-loss = 有效 cell 上的速度平方誤差總和 / 有效 cell 數量
+velocity_mse = 有效數值/one-hot 座標的速度平方誤差平均
+categorical_ce = 有效原始類別 cell 的交叉熵平均，標籤取自乾淨 x1
+loss = velocity_mse + categorical_loss_weight * categorical_ce
 ```
 
-先清除 padding，再計算誤差。全 padding batch 的 loss 是可反向傳播的零。
+先清除 padding，再計算誤差；CE 的 softmax 排除該欄不存在的類別，
+完全 padding 的欄位與表格不參與 CE。全 padding batch 的 loss 是可反向傳播的零。
+訓練資料必須完整觀測，遇到有效觀測標記不是 1 會報錯。編碼寬度與 prior 行為保留。
+
+`--categorical-loss-weight` 預設為 `1.0`，是可調起點，尚未透過實驗確定最佳權重。
+設為 `0` 可做速度 MSE 消融，此時分類頭未受訓練，採樣需使用
+`categorical_method="none"` 再以 one-hot 座標 argmax 解碼。
+驗證 MSE 與 CE 各自按有效座標數／類別 cell 數聚合，再相加；best.pt 依總驗證 loss 選取。
 
 ## GPU 伺服器安裝
 
@@ -87,6 +107,7 @@ python -m script.train \
   --num-rows 512 \
   --log-every 100 \
   --val-every 100 \
+  --categorical-loss-weight 1.0 \
   --device cuda:0 \
   --output-dir runs/v2.2_100k_tables
 ```
@@ -118,13 +139,48 @@ python -m script.train --steps 2 --batch-size 2 --num-rows 16 \
 訓練預設使用 CPU，可指定 `--device`。第一版固定每張表的行數，沒有 row padding。
 驗證表格、噪聲和時間在啟動時固定，之後驗證使用相同批次。
 checkpoint 存到工作目錄的 `checkpoints/best.pt` 和 `checkpoints/latest.pt`；
-可用 `--output-dir` 改變位置。此入口尚未提供中斷後續訓。
+可用 `--output-dir` 改變位置；支援以 `--resume` 接續完整訓練 checkpoint。
 訓練正常結束後，會在相同目錄保存 `loss_curve.png`，同時顯示 train loss 和
 validation loss。Train loss 記錄每一個訓練 step，validation loss 標在實際驗證的
-step；橫軸是 training step，縱軸是有效 cell 上的 velocity MSE。
+step；橫軸是 training step，縱軸是 MSE 加權 CE 的總 loss。
+訓練與驗證日誌分別顯示總 loss、velocity_mse 和 categorical_ce。
 曲線只在訓練結束時繪製，不需要新增命令列參數。
 
 也可以從專案根目錄直接執行 `python script/train.py --help`。
+
+## 中斷後續訓
+
+從 `GenTFM2.2` 目錄執行，指定實際的 latest.pt 路徑。例如輸出放在版本目錄內：
+
+```sh
+python -m script.train --resume runs/v2.2_100k_tables/latest.pt --device cuda:0
+```
+
+若輸出放在 GenTFM_series 根目錄的 runs，則改用
+`--resume ../runs/v2.2_100k_tables/latest.pt`。
+
+- 自動沿用原本的模型、schema、batch size、每表行數、loss 權重與原定總步數。
+- 恢復模型權重、AdamW 狀態、cosine scheduler、最佳驗證 loss、固定驗證批次、
+  Python／NumPy／torch／已初始化 CUDA 的隨機狀態，以及 prior 的生成計數和 cache 建構順序。
+- 從保存的 step + 1 接續；`--steps` 是原定總步數，包含已完成步數。
+  為保留原 cosine 計畫，不允許在 resume 時變更總步數或其他訓練設定。
+  這個入口用於接續中斷的訓練，不用於延長已完成的訓練。
+- 可改 `--device`、`--output-dir`、`--log-every`、`--val-every` 和 `--save-every`。
+  未指定 output-dir 時會繼續寫入 checkpoint 所在目錄，方便搬移到 GPU 伺服器後續訓。
+  指定新目錄時會攜帶原本可取得的 best.pt；找不到對應最佳權重時，重新比較最佳 loss。
+- `--save-every 100` 是預設保存間隔。第 1 步、每次驗證與最後一步也會保存 latest.pt，
+  訓練開始前保存 step=0。best.pt 只在驗證總 loss 改善時更新。
+- checkpoint 先寫入同目錄的暫存檔，完成後才替換正式檔案；保存失敗會保留上一份。
+- Ctrl+C 時不保存可能只完成一部分的 optimizer 更新；可從最後成功寫入的 latest.pt 恢復。
+  突然斷電／強制終止也同樣處理，尚未保存的步數會重新執行。
+- 新 checkpoint 保留 loss 歷史，最終 loss_curve.png 會接續中斷前後的記錄。
+  舊版完整 checkpoint 可恢復權重、optimizer、scheduler 與步數，但缺少隨機狀態、
+  原驗證資料和歷史，會重新生成固定驗證批次並重設最佳 loss，打印說明。
+  只有權重的 slim checkpoint 不能用於 resume。
+
+CPU 的隨機 prior 測試確認中斷／續訓與連續訓練的權重、optimizer、scheduler、
+驗證資料和 loss 歷史一致；正式 TabICL／GPU 續訓尚未實測，跨硬體或非確定性
+GPU 運算不保證逐位一致。
 
 ## 生成
 
@@ -146,15 +202,20 @@ raw = sample_table(model, mask, num_rows=128, n_steps=60, method="heun")
 encoded = sanitize_mixed_encoded(raw[0].numpy(), metadata, *schema.as_tuple())
 ```
 
-sample_table 回傳尚未投影的連續編碼結果；sanitize_mixed_encoded 將類別轉為
-one-hot、觀測標記轉為 0/1、padding 清零。這一步不在 ODE 的中間步驟執行。
+sample_table 用速度頭完成 ODE 後，在 t=1 呼叫分類頭；預設從有效類別機率
+抽樣並輸出精確 one-hot，觀測標記固定為 1，padding 保持為零。
+可用 `categorical_method="argmax"` 改成最大機率類別，或 `"none"` 保留連續類別座標。
+分類投影只在 ODE 結束後執行；sanitize_mixed_encoded 可繼續用來整理編碼。
+使用 generator 可重現噪聲及類別抽樣；輸出不代表已驗證的生成品質改善。
 
 ## 目前範圍
 
 這一版按 feature_mask 生成整張表，沒有 context conditioning。
 inference/generation.py 的 generate_in_context / generate_zero_context 依賴尚未實作的
 條件生成接口，不能用來呼叫此版本；目前請使用 sample_table。
-舊架構 checkpoint 不保證與這個新模型相容。
+原本 v2 的速度模型 checkpoint 未存混合 schema 時，仍以速度模型載入；
+不能直接視為已訓練的分類模型。新增 schema 的 checkpoint 會記錄分類頭設定。
+其他舊架構 checkpoint 不保證相容。
 
 model/ColEmb.py 和 model/RowInteract.py 的既有行為保留。
 data/prior.py 的資料生成邏輯保留。

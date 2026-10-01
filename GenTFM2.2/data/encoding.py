@@ -44,6 +44,31 @@ class Schema:
         return self.max_cont, self.max_cat, self.cat_cardinality
 
 
+def velocity_feature_mask(feature_mask: torch.Tensor, schema: Schema) -> torch.Tensor:
+    """Select numerical/one-hot coordinates, excluding fixed observed bits.
+
+    The original feature_mask still describes the complete encoded table.
+    Fully observed encoding requires matching continuous and observed slots.
+    """
+    if feature_mask.ndim != 2 or feature_mask.shape[1] != schema.encoded_dim:
+        raise ValueError("feature_mask must have shape (B, schema.encoded_dim)")
+    if feature_mask.dtype != torch.bool:
+        raise TypeError("feature_mask must be boolean")
+    if not torch.equal(feature_mask[:, :schema.max_cont], feature_mask[:, schema.mask_start:]):
+        raise ValueError("continuous and observed feature slots must match")
+    mask = feature_mask.clone()
+    mask[:, schema.mask_start:] = False
+    return mask
+
+
+def categorical_feature_mask(feature_mask: torch.Tensor, schema: Schema) -> torch.Tensor:
+    """Return valid classes (B, max_cat, cat_cardinality), including empty fields."""
+    velocity_feature_mask(feature_mask, schema)
+    return feature_mask[:, schema.cat_start:schema.mask_start].reshape(
+        feature_mask.shape[0], schema.max_cat, schema.cat_cardinality,
+    )
+
+
 def encoded_dim(max_cont: int, max_cat: int, cat_cardinality: int) -> int:
     return max_cont + max_cat * cat_cardinality + max_cont
 

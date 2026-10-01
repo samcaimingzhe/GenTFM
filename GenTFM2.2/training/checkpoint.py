@@ -12,8 +12,12 @@ Two kinds of files exist:
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import random
+import tempfile
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
 from model.GenTFM import GenTFM
@@ -27,9 +31,10 @@ def _torch_load(path, device):
 
 
 def save_training_checkpoint(path, step: int, model: GenTFM, optimizer, scheduler, best_loss: float,
-                             train_config: Optional[Dict[str, object]] = None) -> None:
-    torch.save(
-        {
+                             train_config: Optional[Dict[str, object]] = None,
+                             training_state: Optional[Dict[str, object]] = None) -> None:
+    """Atomically replace a full checkpoint, retaining the previous file on failure."""
+    checkpoint = {
             "step": int(step),
             "model_state_dict": model.state_dict(),
             "model_config": model.config(),
@@ -37,9 +42,70 @@ def save_training_checkpoint(path, step: int, model: GenTFM, optimizer, schedule
             "scheduler_state_dict": scheduler.state_dict(),
             "best_loss": float(best_loss),
             "train_config": train_config or {},
-        },
-        path,
-    )
+        }
+    if training_state is not None:
+        checkpoint["training_state"] = training_state
+    _atomic_save(checkpoint, path)
+
+
+def _atomic_save(checkpoint, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            torch.save(checkpoint, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def capture_rng_state() -> dict:
+    """Save global Python, NumPy, CPU torch and initialized CUDA RNG states."""
+    state = {"python": random.getstate(), "numpy": np.random.get_state(),
+             "torch": torch.get_rng_state()}
+    if torch.cuda.is_initialized():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict) -> None:
+    """Restore RNGs after reconstructing the model and prior caches."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available():
+        for index, value in enumerate(state["cuda"][:torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(value.cpu(), index)
+
+
+def load_training_checkpoint(path) -> dict:
+    """Read on CPU and reject inference-only/slim checkpoints before training."""
+    checkpoint = _torch_load(path, "cpu")
+    required = ("step", "model_config", "model_state_dict", "optimizer_state_dict",
+                "scheduler_state_dict", "train_config", "best_loss")
+    missing = [key for key in required if key not in checkpoint]
+    if missing or not checkpoint.get("train_config"):
+        raise ValueError(f"{path} is not a resumable training checkpoint; missing {missing or ['train_config']}")
+    return checkpoint
+
+
+def copy_best_checkpoint(resume_path, output_dir, best_loss, model_config) -> bool:
+    """Carry an available prior best into a different output directory."""
+    resume_path, output_dir = Path(resume_path), Path(output_dir)
+    source = resume_path if resume_path.name == "best.pt" else resume_path.parent / "best.pt"
+    if not source.exists():
+        return False
+    checkpoint = load_training_checkpoint(source)
+    if checkpoint["best_loss"] != best_loss or checkpoint["model_config"] != model_config:
+        return False
+    _atomic_save(checkpoint, output_dir / "best.pt")
+    return True
 
 
 def export_slim_checkpoint(src, dst, model_config: Optional[Dict[str, object]] = None,
