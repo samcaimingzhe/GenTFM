@@ -92,6 +92,7 @@ def load_training_checkpoint(path) -> dict:
     missing = [key for key in required if key not in checkpoint]
     if missing or not checkpoint.get("train_config"):
         raise ValueError(f"{path} is not a resumable training checkpoint; missing {missing or ['train_config']}")
+    _require_conditional(checkpoint.get("model_config", {}))
     return checkpoint
 
 
@@ -131,15 +132,22 @@ def export_slim_checkpoint(src, dst, model_config: Optional[Dict[str, object]] =
 def load_pretrained(path, device: str = "cpu", model_config: Optional[Dict[str, object]] = None) -> Tuple[GenTFM, Dict[str, object]]:
     """Build a :class:`GenTFM` from a checkpoint and return ``(model, checkpoint_dict)``.
 
-    The model config is read from the checkpoint; ``model_config`` overrides it
-    (needed only for legacy checkpoints that do not store a config).
+    Both saved and overridden configs must identify the conditional architecture.
+    Unconditional checkpoints cannot be reinterpreted via a config override.
     """
     device = torch.device(device)
     ckpt = _torch_load(path, device)
     config = dict(model_config or ckpt.get("model_config") or {})
     if not config:
         raise ValueError(f"{path} stores no model_config; pass model_config=... explicitly")
+    _require_conditional(ckpt.get("model_config") or {})
+    _require_conditional(config)
     model = GenTFM(**config).to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
     return model, ckpt
+
+
+def _require_conditional(config: dict) -> None:
+    if config.get("architecture") != "conditional_v1":
+        raise ValueError("This is not a conditional v2.2 checkpoint. Old unconditional weights cannot be resumed or loaded; train a new conditional model.")

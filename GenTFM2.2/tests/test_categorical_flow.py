@@ -9,7 +9,7 @@ import torch
 
 from data.encoding import Schema, batch_feature_mask, velocity_feature_mask
 from model import GenTFM
-from training.flow_matching import categorical_cross_entropy, flow_matching_loss, sample_flow_batch
+from training.flow_matching import categorical_cross_entropy, flow_matching_loss, sample_flow_batch, sample_conditional_flow_batch
 from training.checkpoint import save_training_checkpoint, load_pretrained
 from inference.sampling import sample_table
 from script.train import train_step, validate, main
@@ -67,13 +67,13 @@ class CategoricalFlowTests(unittest.TestCase):
     def test_heads_padding_permutation_and_gradients(self):
         model = self.model()
         xt, t, target = sample_flow_batch(self.x, self.mask, schema=self.schema)
-        outputs = model(xt, t, self.mask, return_aux=True)
+        outputs = model(xt, t, self.mask, self.x, return_aux=True)
         self.assertEqual(outputs['velocity'].shape, self.x.shape)
         self.assertEqual(outputs['categorical_logits'].shape, (3, 3, 2, 3))
         dirty = xt.masked_fill(~self.mask[:, None], float('nan'))
-        dirty_outputs = model(dirty, t, self.mask, return_aux=True)
+        dirty_outputs = model(dirty, t, self.mask, self.x, return_aux=True)
         perm = torch.tensor([2, 0, 1])
-        permuted = model(xt[:, perm], t, self.mask, return_aux=True)
+        permuted = model(xt[:, perm], t, self.mask, self.x, return_aux=True)
         for key, value in outputs.items():
             self.assertTrue(torch.isfinite(value).all())
             self.assertEqual(int(torch.count_nonzero(value[2])), 0)
@@ -86,7 +86,7 @@ class CategoricalFlowTests(unittest.TestCase):
             self.assertGreater(float(head[-1].weight.grad.abs().sum()), 0)
         self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()))
         empty_mask = torch.zeros_like(self.mask)
-        empty_outputs = model(torch.full_like(xt, float('nan')), t, empty_mask, return_aux=True)
+        empty_outputs = model(torch.full_like(xt, float('nan')), t, empty_mask, self.x, return_aux=True)
         zero = flow_matching_loss(empty_outputs, target, self.x, empty_mask, self.schema)['loss']
         self.assertEqual(float(zero), 0)
         zero.backward()
@@ -100,8 +100,8 @@ class CategoricalFlowTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(metrics['loss']))
         self.assertFalse(torch.equal(before, model.categorical_head[-1].weight))
         xt, t, target = sample_flow_batch(self.x, self.mask, schema=self.schema)
-        combined = [(xt, t, target, self.mask, self.x)]
-        split = [(xt[i:i+1], t[i:i+1], target[i:i+1], self.mask[i:i+1], self.x[i:i+1]) for i in range(3)]
+        combined = [(xt, t, target, self.mask, self.x, self.x)]
+        split = [(xt[i:i+1], t[i:i+1], target[i:i+1], self.mask[i:i+1], self.x[i:i+1], self.x[i:i+1]) for i in range(3)]
         a = validate(model, combined, .8, return_metrics=True)
         b = validate(model, split, .8, return_metrics=True)
         for key in a:
@@ -110,16 +110,16 @@ class CategoricalFlowTests(unittest.TestCase):
             path = Path(directory)/'model.pt'
             save_training_checkpoint(path, 1, model, optimizer, scheduler, a['loss'])
             restored, _ = load_pretrained(path)
-            for key, value in model(xt, t, self.mask, return_aux=True).items():
-                torch.testing.assert_close(restored(xt, t, self.mask, return_aux=True)[key], value)
+            for key, value in model(xt, t, self.mask, self.x, return_aux=True).items():
+                torch.testing.assert_close(restored(xt, t, self.mask, self.x, return_aux=True)[key], value)
             # Force the valid class 0: invalid high-logit classes must never win.
             with torch.no_grad():
                 for p in restored.categorical_head.parameters():
                     p.zero_()
-                restored.categorical_head[-1].bias.copy_(torch.tensor([100., -100., 1000.]))
+                restored.categorical_head[-1].bias.copy_(torch.tensor([100., -100., 1000., 100., -100., 1000.]))
             for method in ('euler', 'heun'):
                 for decoding in ('sample', 'argmax'):
-                    y = sample_table(restored, self.mask, 4, n_steps=2, method=method,
+                    y = sample_table(restored, self.x, self.mask, 4, n_steps=2, method=method,
                                      categorical_method=decoding, generator=torch.Generator().manual_seed(9))
                     self.assertTrue(torch.isfinite(y).all())
                     self.assertEqual(int(torch.count_nonzero(y.masked_select(~self.mask[:, None]))), 0)
@@ -138,6 +138,7 @@ class CategoricalFlowTests(unittest.TestCase):
                 return x.clone(), metadata
         with tempfile.TemporaryDirectory() as directory:
             argv = ['train', '--steps', '2', '--batch-size', '2', '--num-rows', '3',
+                    '--min-context', '1', '--max-context', '1', '--min-target', '1',
                     '--max-cont', '2', '--max-cat', '2', '--cat-cardinality', '3',
                     '--embed-dim', '8', '--num-col-blocks', '1', '--num-row-blocks', '1',
                     '--nhead', '2', '--dim-feedforward', '16', '--num-inds', '3',

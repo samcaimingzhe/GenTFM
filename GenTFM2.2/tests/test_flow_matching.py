@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from model import GenTFM
-from training.flow_matching import masked_velocity_loss, sample_flow_batch
+from training.flow_matching import masked_velocity_loss, sample_flow_batch, sample_conditional_flow_batch
 from inference.sampling import sample_table
 from training.checkpoint import export_slim_checkpoint, load_pretrained, save_training_checkpoint
 from script.train import train_step, validate
@@ -55,21 +55,21 @@ class FlowTests(unittest.TestCase):
                     model = small_model(norm_first=norm_first, recompute=recompute)
                     x = self.x.clone().requires_grad_()
                     t = torch.tensor([.2, .7])
-                    y = model(x, t, self.mask)
+                    y = model(x, t, self.mask, self.x)
                     self.assertEqual(y.shape, x.shape)
                     self.assertTrue(torch.isfinite(y).all())
                     valid = self.mask[:, None, :].expand_as(x)
                     self.assertEqual(int(torch.count_nonzero(y[~valid])), 0)
                     dirty = x.detach().masked_fill(~valid, float('nan'))
-                    torch.testing.assert_close(model(dirty, t, self.mask), y)
+                    torch.testing.assert_close(model(dirty, t, self.mask, self.x), y)
                     perm = torch.tensor([2, 0, 3, 1])
-                    torch.testing.assert_close(model(x[:, perm], t, self.mask), y[:, perm], atol=2e-6, rtol=2e-5)
-                    self.assertFalse(torch.allclose(y[0], model(x, torch.tensor([.6, .7]), self.mask)[0]))
+                    torch.testing.assert_close(model(x[:, perm], t, self.mask, self.x), y[:, perm], atol=2e-6, rtol=2e-5)
+                    self.assertFalse(torch.allclose(y[0], model(x, torch.tensor([.6, .7]), self.mask, self.x)[0]))
                     y.square().sum().backward()
                     self.assertTrue(torch.isfinite(x.grad).all())
                     self.assertEqual(int(torch.count_nonzero(x.grad[~valid])), 0)
                     self.assertGreater(float(model.time_embedding.mlp[0].weight.grad.abs().sum()), 0.)
-                    empty = model(torch.full_like(x, float('nan')), t, torch.zeros_like(self.mask))
+                    empty = model(torch.full_like(x, float('nan')), t, torch.zeros_like(self.mask), self.x)
                     self.assertTrue(torch.isfinite(empty).all())
                     self.assertEqual(int(torch.count_nonzero(empty)), 0)
                     empty.sum().backward()
@@ -80,7 +80,9 @@ class FlowTests(unittest.TestCase):
                 super().__init__()
                 self.anchor = nn.Parameter(torch.zeros(()))
                 self.child = nn.Dropout()
-            def forward(self, x, t, mask):
+            def encode_context(self, context, mask):
+                return context
+            def forward(self, x, t, mask, *, context_embeddings):
                 return t[:, None, None].expand_as(x)
         model = TimeVelocity()
         model.train()
@@ -88,15 +90,15 @@ class FlowTests(unittest.TestCase):
         valid = self.mask[:, None, :].expand_as(self.x)
         noise = torch.randn(self.x.shape, generator=torch.Generator().manual_seed(12)).masked_fill(~valid, 0.)
         for method, shift in (("euler", .375), ("heun", .5)):
-            y = sample_table(model, self.mask, 4, n_steps=4, method=method,
+            y = sample_table(model, self.x, self.mask, 4, n_steps=4, method=method,
                              generator=torch.Generator().manual_seed(12))
             torch.testing.assert_close(y, (noise + shift).masked_fill(~valid, 0.))
             self.assertTrue(model.training)
             self.assertFalse(model.child.training)
         with self.assertRaises(ValueError):
-            sample_table(model, self.mask, 4, n_steps=0)
+            sample_table(model, self.x, self.mask, 4, n_steps=0)
         with self.assertRaises(ValueError):
-            sample_table(model, self.mask, 4, method='unknown')
+            sample_table(model, self.x, self.mask, 4, method='unknown')
 
     def test_training_validation_checkpoint_and_sampling(self):
         model = small_model()
@@ -107,7 +109,7 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertFalse(torch.equal(before, model.velocity_head[-1].weight))
         scheduler.step()
-        batch = (*sample_flow_batch(self.x, self.mask), self.mask)
+        batch = sample_conditional_flow_batch(self.x, self.mask, min_context=2, max_context=2)
         validation = validate(model, [batch])
         self.assertEqual(validation, validate(model, [batch]))
         self.assertTrue(model.training)
@@ -120,9 +122,9 @@ class FlowTests(unittest.TestCase):
                 restored, ckpt = load_pretrained(path)
                 self.assertEqual(ckpt['step'], 1)
                 model.eval()
-                torch.testing.assert_close(restored(*batch[:2], self.mask), model(*batch[:2], self.mask))
+                torch.testing.assert_close(restored(*batch[:2], self.mask, batch[5]), model(*batch[:2], self.mask, batch[5]))
                 for method in ('euler', 'heun'):
-                    y = sample_table(restored, self.mask, 3, n_steps=2, method=method)
+                    y = sample_table(restored, self.x, self.mask, 3, n_steps=2, method=method)
                     self.assertEqual(y.shape, (2, 3, 5))
                     self.assertTrue(torch.isfinite(y).all())
                     self.assertEqual(int(torch.count_nonzero(y[1])), 0)

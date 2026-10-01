@@ -1,4 +1,4 @@
-"""Unconditional Euler and Heun ODE sampling."""
+"""Conditional Euler and Heun ODE sampling with a cached clean context."""
 from __future__ import annotations
 
 import torch
@@ -9,7 +9,7 @@ from data.encoding import Schema, categorical_feature_mask, velocity_feature_mas
 
 @torch.no_grad()
 def sample_table(
-    model: nn.Module, feature_mask: Tensor, num_rows: int,
+    model: nn.Module, context: Tensor, feature_mask: Tensor, num_rows: int,
     n_steps: int = 60, method: str = "euler", *,
     generator: torch.Generator | None = None,
     categorical_method: str = "sample",
@@ -19,6 +19,7 @@ def sample_table(
     Mixed-schema models keep observed bits fixed at one and decode final
     categories with the CE head ('sample' or 'argmax'). 'none' returns raw
     one-hot flow coordinates for ablations. Legacy models return raw coordinates.
+    context must contain clean, context-normalized rows on the model device.
     The generator and feature_mask must be on the model's device.
     """
     if not isinstance(num_rows, int) or num_rows < 1:
@@ -47,24 +48,23 @@ def sample_table(
         schema = Schema(model.max_cont, model.max_cat, model.cat_cardinality)
         velocity_feature_mask(feature_mask, schema)
         x[..., schema.mask_start:] = feature_mask[:, None, schema.mask_start:].to(x.dtype)
-    if not valid.any():
-        return x
     times = torch.linspace(0, 1, n_steps + 1, device=x.device, dtype=x.dtype)
     modes = [(module, module.training) for module in model.modules()]
     model.eval()
     try:
+        context_embeddings = model.encode_context(context, feature_mask)
         for step in range(n_steps):
             dt = times[step + 1] - times[step]
-            v = model(x, times[step].expand(B), feature_mask)
+            v = model(x, times[step].expand(B), feature_mask, context_embeddings=context_embeddings)
             if method == "euler":
                 x = x + dt * v
             else:
                 proposal = (x + dt * v).masked_fill(~valid, 0.0)
-                v_next = model(proposal, times[step + 1].expand(B), feature_mask)
+                v_next = model(proposal, times[step + 1].expand(B), feature_mask, context_embeddings=context_embeddings)
                 x = x + dt * (v + v_next) / 2
             x = x.masked_fill(~valid, 0.0)
         if schema is not None and categorical_method != "none":
-            outputs = model(x, times[-1].expand(B), feature_mask, return_aux=True)
+            outputs = model(x, times[-1].expand(B), feature_mask, context_embeddings=context_embeddings, return_aux=True)
             logits = outputs["categorical_logits"]
             classes = categorical_feature_mask(feature_mask, schema)
             active = classes.any(-1)[:, None, :].expand(B, num_rows, schema.max_cat)

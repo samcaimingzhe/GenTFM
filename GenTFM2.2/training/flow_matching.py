@@ -1,4 +1,4 @@
-"""Linear flow paths and masked cell-wise velocity MSE for training."""
+"""Conditional flow paths, context-only scaling and target-only objectives."""
 from __future__ import annotations
 
 import torch
@@ -49,10 +49,11 @@ def sample_flow_batch(
     return (1 - t_view) * x_0 + t_view * x_1, t, x_1 - x_0
 
 
-def masked_velocity_loss(prediction: Tensor, target: Tensor, feature_mask: Tensor) -> Tensor:
+def masked_velocity_loss(prediction: Tensor, target: Tensor, feature_mask: Tensor,
+                         weights: Tensor | None = None) -> Tensor:
     """Mean squared velocity error across all valid cells in the batch.
 
-    Every encoded coordinate has equal weight, including categorical one-hots.
+    Without weights, every active coordinate has equal weight.
     An all-padding batch returns differentiable zero, even with NaN padding.
     """
     valid = _valid_cells(prediction, feature_mask)
@@ -65,7 +66,14 @@ def masked_velocity_loss(prediction: Tensor, target: Tensor, feature_mask: Tenso
     error = prediction.masked_fill(~valid, 0.0) - target.masked_fill(~valid, 0.0)
     if error.dtype in (torch.float16, torch.bfloat16):
         error = error.float()
-    return error.square().sum() / valid.sum().clamp_min(1)
+    if weights is None:
+        return error.square().sum() / valid.sum().clamp_min(1)
+    if weights.shape != feature_mask.shape or weights.device != prediction.device:
+        raise ValueError("velocity weights must match the feature mask")
+    weights = weights.masked_fill(~feature_mask, 0.0)
+    if not torch.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError("velocity weights must be finite and nonnegative")
+    return (error.square() * weights[:, None]).sum() / (weights.sum() * target.shape[1]).clamp_min(1e-12)
 
 
 def categorical_cross_entropy(logits: Tensor, x_1: Tensor,
@@ -98,11 +106,79 @@ def categorical_cross_entropy(logits: Tensor, x_1: Tensor,
 
 def flow_matching_loss(outputs: dict, target_velocity: Tensor, x_1: Tensor,
                        feature_mask: Tensor, schema: Schema,
-                       categorical_weight: float = 1.0) -> dict[str, Tensor]:
-    """Total = valid numerical/one-hot velocity MSE + weight * categorical CE."""
+                       categorical_weight: float = 0.8, discrete_flow_weight: float = 0.05) -> dict[str, Tensor]:
+    """Total = weighted target velocity MSE + categorical_weight * target CE."""
     if not 0 <= categorical_weight < float("inf"):
         raise ValueError("categorical_weight must be finite and nonnegative")
+    weights = velocity_weights(feature_mask, schema, discrete_flow_weight)
     mse = masked_velocity_loss(outputs["velocity"], target_velocity,
-                               velocity_feature_mask(feature_mask, schema))
+                               velocity_feature_mask(feature_mask, schema), weights)
     ce = categorical_cross_entropy(outputs["categorical_logits"], x_1, feature_mask, schema)
     return {"loss": mse + categorical_weight * ce, "velocity_mse": mse, "categorical_ce": ce}
+
+
+def split_context_target(
+    tables: Tensor, feature_mask: Tensor, *, min_context: int = 1,
+    max_context: int = 500, min_target: int = 1,
+    context_sizes: list[int] | None = None, schema: Schema | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Shuffle within each table, split disjoint rows, then scale from context only.
+
+    One K is sampled per batch (no row padding). No target values contribute
+    to the mean/std used on either branch. All remaining rows are targets.
+    """
+    valid = _valid_cells(tables, feature_mask)
+    B, total, D = tables.shape
+    if min_context < 1 or max_context < min_context or min_target < 1:
+        raise ValueError("invalid context/target row limits")
+    high = min(max_context, total - min_target)
+    if high < min_context:
+        raise ValueError("not enough rows for the requested context/target split")
+    if context_sizes is not None:
+        if not context_sizes or any(k < min_context or k > high for k in context_sizes):
+            raise ValueError("all context_sizes must fit context/target row limits")
+        K = context_sizes[int(torch.randint(len(context_sizes), (), device=tables.device, generator=generator))]
+    else:
+        K = int(torch.randint(min_context, high + 1, (), device=tables.device, generator=generator))
+    tables = tables.masked_fill(~valid, 0.0)
+    if not torch.isfinite(tables).all():
+        raise ValueError("active training values must be finite")
+    if schema is not None:
+        velocity_feature_mask(feature_mask, schema)
+        observed = feature_mask[:, None, schema.mask_start:].expand_as(tables[..., schema.mask_start:])
+        if not torch.equal(tables[..., schema.mask_start:], observed.to(tables.dtype)):
+            raise ValueError("missing observations are unsupported")
+    order = torch.rand(B, total, device=tables.device, generator=generator).argsort(dim=1)
+    shuffled = tables.gather(1, order[..., None].expand(B, total, D))
+    context, target = shuffled[:, :K].clone(), shuffled[:, K:].clone()
+    if schema is not None:
+        # Match raw-context generation: population std + epsilon; constant columns use 1.
+        values = context[..., :schema.max_cont]
+        mean = values.mean(1, keepdim=True)
+        std = values.std(1, keepdim=True, correction=0)
+        std = torch.where(std > 1e-6, std + 1e-6, torch.ones_like(std))
+        context[..., :schema.max_cont] = (values - mean) / std
+        target[..., :schema.max_cont] = (target[..., :schema.max_cont] - mean) / std
+        context = context.masked_fill(~feature_mask[:, None], 0.0)
+        target = target.masked_fill(~feature_mask[:, None], 0.0)
+    return context, target
+
+
+def sample_conditional_flow_batch(tables: Tensor, feature_mask: Tensor, *,
+                                  schema: Schema | None = None,
+                                  generator: torch.Generator | None = None, **split_kwargs) -> tuple:
+    """Fixed validation format: (x_t, t, velocity, mask, clean_target, context)."""
+    context, target = split_context_target(tables, feature_mask, schema=schema,
+                                           generator=generator, **split_kwargs)
+    x_t, t, velocity = sample_flow_batch(target, feature_mask, schema=schema, generator=generator)
+    return x_t, t, velocity, feature_mask, target, context
+
+
+def velocity_weights(feature_mask: Tensor, schema: Schema, discrete_flow_weight: float = 0.05) -> Tensor:
+    """V1-style weighting: numerical 1, one-hot configurable, observed bits 0."""
+    if not 0 <= discrete_flow_weight < float("inf"):
+        raise ValueError("discrete_flow_weight must be finite and nonnegative")
+    weights = velocity_feature_mask(feature_mask, schema).float()
+    weights[:, schema.cat_start:schema.mask_start] *= discrete_flow_weight
+    return weights

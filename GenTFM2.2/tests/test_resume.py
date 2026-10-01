@@ -45,6 +45,7 @@ class RandomPrior:
 class ResumeTests(unittest.TestCase):
     def run_main(self, directory, extra=None, interrupted=False):
         argv = ['train', '--steps', '4', '--batch-size', '2', '--num-rows', '3',
+                '--min-context', '1', '--max-context', '1', '--min-target', '1',
                 '--max-cont', '2', '--max-cat', '2', '--cat-cardinality', '3',
                 '--embed-dim', '8', '--num-col-blocks', '1', '--num-row-blocks', '1',
                 '--nhead', '2', '--dim-feedforward', '16', '--num-inds', '3',

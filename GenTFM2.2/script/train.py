@@ -1,4 +1,4 @@
-"""Train the unconditional GenTFM on TabICL synthetic tables.
+"""Train the conditional GenTFM on TabICL synthetic tables.
 
 Run from the project root: python -m script.train --steps 1000
 Or run directly from the project root: python script/train.py --steps 1000
@@ -24,7 +24,8 @@ from training.checkpoint import (capture_rng_state, copy_best_checkpoint, load_t
                                  restore_rng_state, save_training_checkpoint)
 from training.plotting import save_loss_curve
 from data.encoding import Schema, batch_feature_mask, categorical_feature_mask, velocity_feature_mask
-from training.flow_matching import flow_matching_loss, masked_velocity_loss, sample_flow_batch
+from training.flow_matching import (flow_matching_loss, masked_velocity_loss,
+                                    sample_conditional_flow_batch, velocity_weights)
 from data.prior import PriorConfig, TabICLPriorEngine
 
 
@@ -32,29 +33,36 @@ def build_training_batch(prior, schema, batch_size, num_rows, device, split="tra
     tables, metadata = prior.sample_batch(
         batch_size, num_rows, return_metadata=True, split=split,
     )
+    if tables.shape != (batch_size, num_rows, schema.encoded_dim):
+        raise ValueError(f"prior returned {tuple(tables.shape)}; expected {(batch_size, num_rows, schema.encoded_dim)}")
     mask = batch_feature_mask(metadata, *schema.as_tuple(), device=device)
     return tables.to(device), mask
 
 
 def model_schema(model):
-    """Mixed schema, or None for a legacy velocity-only model."""
+    """Mixed schema, or None for a numerical-only conditional model."""
     if model.max_cont is None:
         return None
     return Schema(model.max_cont, model.max_cat, model.cat_cardinality)
 
 
 def train_step(model, optimizer, tables, feature_mask, max_grad_norm=1.0,
-               categorical_weight=1.0, *, return_metrics=False):
+               categorical_weight=0.8, *, return_metrics=False,
+               discrete_flow_weight=0.05, min_context=1, max_context=500,
+               min_target=1, context_sizes=None):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     schema = model_schema(model)
-    x_t, t, target = sample_flow_batch(tables, feature_mask, schema=schema)
+    x_t, t, target, _, clean_target, context = sample_conditional_flow_batch(
+        tables, feature_mask, schema=schema, min_context=min_context,
+        max_context=max_context, min_target=min_target, context_sizes=context_sizes,
+    )
     if schema is None:
-        mse = masked_velocity_loss(model(x_t, t, feature_mask), target, feature_mask)
+        mse = masked_velocity_loss(model(x_t, t, feature_mask, context), target, feature_mask)
         metrics = {"loss": mse, "velocity_mse": mse, "categorical_ce": mse.new_zeros(())}
     else:
-        metrics = flow_matching_loss(model(x_t, t, feature_mask, return_aux=True),
-                                     target, tables, feature_mask, schema, categorical_weight)
+        metrics = flow_matching_loss(model(x_t, t, feature_mask, context, return_aux=True),
+                                     target, clean_target, feature_mask, schema, categorical_weight, discrete_flow_weight)
     loss = metrics["loss"]
     if not torch.isfinite(loss):
         raise FloatingPointError("non-finite training loss")
@@ -67,11 +75,11 @@ def train_step(model, optimizer, tables, feature_mask, max_grad_norm=1.0,
 
 
 @torch.no_grad()
-def validate(model, validation_batches, categorical_weight=1.0, *, return_metrics=False):
+def validate(model, validation_batches, categorical_weight=0.8, *, return_metrics=False, discrete_flow_weight=0.05):
     """Aggregate MSE and CE by their respective valid cell counts.
 
-    Mixed batches contain (x_t, t, target_velocity, mask, clean_x_1).
-    Legacy velocity-only batches retain their original four-element interface.
+    Batches contain (x_t, t, target_velocity, mask, clean_target, context).
+    Context is fixed and excluded from both MSE and CE.
     """
     modes = [(module, module.training) for module in model.modules()]
     total_error, total_cells = 0.0, 0
@@ -80,19 +88,19 @@ def validate(model, validation_batches, categorical_weight=1.0, *, return_metric
     model.eval()
     try:
         for batch in validation_batches:
-            x_t, t, target, mask = batch[:4]
+            if len(batch) != 6:
+                raise ValueError("conditional validation requires clean targets and context")
+            x_t, t, target, mask, clean_target, context = batch
             if schema is None:
-                loss = masked_velocity_loss(model(x_t, t, mask), target, mask)
+                loss = masked_velocity_loss(model(x_t, t, mask, context), target, mask)
                 mse, ce = loss, loss.new_zeros(())
                 count = int(mask.sum()) * x_t.shape[1]
                 cat_count = 0
             else:
-                if len(batch) != 5:
-                    raise ValueError("categorical validation requires clean x_1 targets")
-                metrics = flow_matching_loss(model(x_t, t, mask, return_aux=True),
-                                             target, batch[4], mask, schema, categorical_weight)
+                metrics = flow_matching_loss(model(x_t, t, mask, context, return_aux=True),
+                                             target, clean_target, mask, schema, categorical_weight, discrete_flow_weight)
                 loss, mse, ce = metrics["loss"], metrics["velocity_mse"], metrics["categorical_ce"]
-                count = int(velocity_feature_mask(mask, schema).sum()) * x_t.shape[1]
+                count = float(velocity_weights(mask, schema, discrete_flow_weight).sum()) * x_t.shape[1]
                 cat_count = int(categorical_feature_mask(mask, schema).any(-1).sum()) * x_t.shape[1]
             if not torch.isfinite(loss):
                 raise FloatingPointError("non-finite validation loss")
@@ -103,9 +111,9 @@ def validate(model, validation_batches, categorical_weight=1.0, *, return_metric
     finally:
         for module, training in modes:
             module.training = training
-    if total_cells == 0:
+    if total_cells == 0 and total_cat_cells == 0:
         raise ValueError("validation requires at least one valid cell")
-    mse = total_error / total_cells
+    mse = total_error / max(total_cells, 1e-12)
     ce = total_ce / max(total_cat_cells, 1)
     metrics = {"loss": mse + categorical_weight * ce, "velocity_mse": mse, "categorical_ce": ce}
     return metrics if return_metrics else metrics["loss"]
@@ -115,7 +123,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--steps", type=int, default=1000, help="Total planned optimizer steps, including completed steps")
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-rows", type=int, default=128)
+    parser.add_argument("--num-rows", type=int, default=1024, help="Total context + target rows per prior table")
+    parser.add_argument("--min-context", type=int, default=5)
+    parser.add_argument("--max-context", type=int, default=500)
+    parser.add_argument("--min-target", type=int, default=512)
+    parser.add_argument("--context-sizes", type=int, nargs="+", help="Optional fixed set of training context sizes")
+    parser.add_argument("--num-cross-blocks", type=int, default=2)
+    parser.add_argument("--discrete-flow-weight", type=float, default=0.05, help="One-hot velocity weight relative to numerical coordinates")
     parser.add_argument("--embed-dim", type=int, default=128)
     parser.add_argument("--num-col-blocks", type=int, default=2)
     parser.add_argument("--num-row-blocks", type=int, default=2)
@@ -129,7 +143,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--categorical-loss-weight", type=float, default=1.0,
+    parser.add_argument("--categorical-loss-weight", type=float, default=0.8,
                         help="Weight of clean-category CE in MSE + weight * CE")
     parser.add_argument("--val-every", type=int, default=100)
     parser.add_argument("--val-batches", type=int, default=2)
@@ -160,7 +174,7 @@ def parse_args():
         if 'output_dir' not in explicit:
             args.output_dir = args.resume.resolve().parent
         args._resume_checkpoint = checkpoint
-    for name in ("steps", "batch_size", "num_rows", "val_every", "val_batches", "log_every", "save_every"):
+    for name in ("steps", "batch_size", "num_rows", "val_every", "val_batches", "log_every", "save_every", "min_context", "max_context", "min_target", "num_cross_blocks"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_cont < 1 or args.max_cat < 1 or args.cat_cardinality < 2:
@@ -169,6 +183,12 @@ def parse_args():
         parser.error("lr and max-grad-norm must be positive; weight-decay must be nonnegative")
     if not 0 <= args.categorical_loss_weight < float("inf"):
         parser.error("categorical-loss-weight must be finite and nonnegative")
+    if args.max_context < args.min_context or args.num_rows < args.max_context + args.min_target:
+        parser.error("num-rows must cover max-context + min-target; context limits must be ordered")
+    if args.context_sizes and any(k < args.min_context or k > args.max_context for k in args.context_sizes):
+        parser.error("context-sizes must fall between min-context and max-context")
+    if not 0 <= args.discrete_flow_weight < float("inf"):
+        parser.error("discrete-flow-weight must be finite and nonnegative")
     return args
 
 
@@ -220,6 +240,7 @@ def main():
             num_col_blocks=args.num_col_blocks, num_row_blocks=args.num_row_blocks,
             nhead=args.nhead, dim_feedforward=args.dim_feedforward, num_inds=args.num_inds,
             max_cont=schema.max_cont, max_cat=schema.max_cat, cat_cardinality=schema.cat_cardinality,
+            num_cross_blocks=args.num_cross_blocks,
         ).to(device)
     prior = TabICLPriorEngine(schema, prior_config, output_device=str(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -243,7 +264,11 @@ def main():
             tables, mask = build_training_batch(
                 prior, schema, args.batch_size, args.num_rows, device, split="validation",
             )
-            validation_batches.append((*sample_flow_batch(tables, mask, generator=generator, schema=flow_schema), mask, tables))
+            validation_batches.append(sample_conditional_flow_batch(
+                tables, mask, generator=generator, schema=flow_schema,
+                min_context=args.min_context, max_context=args.max_context,
+                min_target=args.min_target, context_sizes=args.context_sizes,
+            ))
         if checkpoint:
             # Old full checkpoints lack validation/RNG history. Resume weights,
             # optimizer and schedule, but start a new validation comparison.
@@ -275,7 +300,10 @@ def main():
         for step in range(start_step + 1, args.steps + 1):
             tables, mask = build_training_batch(prior, schema, args.batch_size, args.num_rows, device)
             metrics = train_step(model, optimizer, tables, mask, args.max_grad_norm,
-                                 args.categorical_loss_weight, return_metrics=True)
+                                 args.categorical_loss_weight, return_metrics=True,
+                                 discrete_flow_weight=args.discrete_flow_weight,
+                                 min_context=args.min_context, max_context=args.max_context,
+                                 min_target=args.min_target, context_sizes=args.context_sizes)
             loss = metrics["loss"]
             scheduler.step()
             train_history.append((step, float(loss)))
@@ -285,7 +313,8 @@ def main():
                       f"categorical_ce={float(metrics['categorical_ce']):.6f}", flush=True)
             validation_due = step % args.val_every == 0 or step == args.steps
             if validation_due:
-                val_metrics = validate(model, validation_batches, args.categorical_loss_weight, return_metrics=True)
+                val_metrics = validate(model, validation_batches, args.categorical_loss_weight, return_metrics=True,
+                                       discrete_flow_weight=args.discrete_flow_weight)
                 val_loss = val_metrics["loss"]
                 validation_history.append((step, val_loss))
                 print(f"step={step} validation_loss={val_loss:.6f} "
