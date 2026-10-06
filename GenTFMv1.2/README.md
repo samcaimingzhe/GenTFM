@@ -7,10 +7,10 @@
 - `cat_encoding=binary`：分類 ID → 高位在前的 bits；預設 schema 從 160 維變為 96 維。數值仍是連續值。
 - 分類 head 仍輸出每欄 12 類 logits，按該欄真實 cardinality 取樣，再編碼回合法 bits。分類 y 的 embedding 仍接收整數 ID。
 - `num_query=200`：精確取 200 context + 200 query；未選中的 prior 行不計入 loss。設為 `0` 可回到 `Q=N−K`。
-- `query_conditioning=context_plus_noisy_query`：在原 attention 的 K/V 中加入當層 noisy-query hidden。`context_only` 保留原 attention 行為。
+- `query_conditioning=context_plus_noisy_query`：在原 attention 的 K/V 中加入當層 noisy-query hidden；每個 query 只能注意 context 和自己的 noisy hidden，不能讀取其他 query。`context_only` 保留原 attention 行為。
 - schema、metadata、校準、生成、baseline、metrics 和 checkpoint 均傳遞 codec 配置。
 
-query 加噪在 v1.1 已存在；query 間互動是我們的候選變體，不是 DiffICL 的 attention 復現。它會使生成結果依賴同批共同生成的行數，應記錄 `num_gen`／chunk。
+query 加噪在 v1.1 已存在。現在的 noisy-query memory 僅加入每行自己的 hidden，不會產生 query 間互動；先前未加 mask 的實驗與目前行為不同。
 
 ## 環境
 
@@ -94,7 +94,7 @@ python scripts/sample_prior.py --cat_encoding binary \
 
 ## Checkpoint 與限制
 
-- 新 checkpoint 保存 codec、schema version 和 query-conditioning；train config 保存 K/Q、種子及其他訓練設定。
+- 新 checkpoint 保存 codec、schema version 和 query-conditioning；train config 保存 K/Q、種子及其他訓練設定。舊的 `context_plus_noisy_query` checkpoint 是在 query 間可互看的注意力下訓練的；雖然參數形狀相同，應重新訓練再評估新 mask 的效果。
 - 舊 checkpoint 缺新增欄位時按 onehot／context_only 載入。binary 的投影／velocity 尺寸不同，需新訓練；不使用 `strict=False` 續訓。
 - resume 會拒絕不相容的模型配置或 K/Q／任務配置。
 - 數值訓練正規化仍使用整張 prior table；生成 wrapper 使用 context 統計。四組沿用相同政策，這個已有差異另作後續研究。

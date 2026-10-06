@@ -173,11 +173,20 @@ class TabularFlowBlock(nn.Module):
         query = self.cross_norm(x)
         if query_conditioning == "context_only":
             memory = context
+            attn_mask = None
         elif query_conditioning == "context_plus_noisy_query":
             memory = torch.cat([context, query], dim=1)
+            n_query = query.shape[1]
+            n_context = context.shape[1]
+            # Each row may read the context and its own noisy state, but no other query row.
+            attn_mask = torch.cat([
+                torch.zeros((n_query, n_context), dtype=torch.bool, device=query.device),
+                ~torch.eye(n_query, dtype=torch.bool, device=query.device),
+            ], dim=1)
         else:
             raise ValueError(f"Unsupported query_conditioning: {query_conditioning}")
-        cross_out, _ = self.cross_attn(query=query, key=memory, value=memory, need_weights=False)
+        cross_out, _ = self.cross_attn(query=query, key=memory, value=memory,
+                                      attn_mask=attn_mask, need_weights=False)
         x = x + cross_out
         x = x + self.mlp(self.mlp_norm(x))
         return x
