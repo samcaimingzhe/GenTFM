@@ -1,0 +1,16 @@
+{
+  "cat_encoding": "onehot",
+  "binary_bit_order": "msb_first",
+  "query_conditioning": "context_only",
+  "min_ctx": 200,
+  "max_ctx": 200,
+  "num_query": 200,
+  "min_target": 200,
+  "rows_per_dataset": 768,
+  "batch_size": 8,
+  "n_iterations": 100000,
+  "seed": 1400,
+  "target_task": "classification",
+  "output_dir": "outputs/v1_2_oh_ctx_cls",
+  "skip_synthetic_eval": true
+}
