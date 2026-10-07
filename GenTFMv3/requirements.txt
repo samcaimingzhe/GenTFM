@@ -1,0 +1,5 @@
+torch>=2.3
+tabicl==2.1.1
+xgboost
+numpy
+huggingface-hub
